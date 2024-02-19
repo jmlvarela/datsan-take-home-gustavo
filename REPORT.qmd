@@ -1,0 +1,186 @@
+---
+title: "REPORT"
+format: 
+  html:
+    code-fold: true
+    code-tools: true
+    df-print: paged
+---
+
+## Loading the data
+
+Some boilerplate, libraries and loading. I will transform the columns type and postal_code into factors.
+
+```{r}
+#| warning: false
+#| label: loading_data
+library(tidyverse)
+library(ggpubr)
+library(rsample)
+library(vtreat)
+library(xgboost)
+library(skimr)
+library(ROCR)
+library(pROC)
+library(SHAPforxgboost)
+party=read_csv("party.csv")
+tx=read_csv("tx.csv")
+party$type=as_factor(party$type)
+party$postal_code=as_factor(party$postal_code)
+```
+
+## Joining the tables
+
+A quick inspection shows that the tx table only contains data from one date, `r unique(tx$date)`. We can also see that "party" has `r length(unique(party$id))` different ids, while "tx" has `r length(unique(tx$id))` ids. So there will be cases of **suspicious_label** on ids that do not have any transaction(!).
+
+Before joining, I will group "tx" by id and add some features to it, namely sum, mean, min, max, range, median absolute deviation (similar to standard deviation but avoids NAs in cases of just one transaction) and count.
+
+Then I will join party and tx on id.
+
+```{r}
+#| label: feature_eng
+tx_grp = tx %>% group_by(id) %>% summarise(total=sum(tx), mean_tx=mean(tx), mad_tx=mad(tx), min_tx=min(tx), max_tx=max(tx), range=max(tx)-min(tx), count_tx=n()) 
+df = party %>% left_join(tx_grp, by="id")
+head(df)
+skim(df)
+```
+
+As previously mentioned, overall there are `r round(100*mean(party$suspicious_label,na.rm=T),2)`% of suspicious labels in the training set. However, for those ids with no transactions it is higher at `r round(100*mean(df$suspicious_label[is.na(df$total)],na.rm=T),2)`%, while those with transactions are `r round(100*mean(df$suspicious_label[!is.na(df$total)],na.rm=T),2)`%
+
+**This is a potential issue as some of the labels will be based only on demographics or previous knowledge not available to this model.**
+
+## Modeling
+
+### Data Prep
+
+In order to model, I will
+
+-   substitute all NAs to the value -999 as imputing will not make sense, to be later used in XGBoost
+-   convert type to dummy variables
+-   remove id
+-   remove postal_code as it is a factor with too many values and only a few repeat no more than 4 times, with high potential for overfitting.
+-   separate into training and testing as per instructions (suspicious_label==NA)
+
+```{r}
+#| warning: false
+#| label: preparation
+df[is.na(df)]=-999
+mk=designTreatmentsZ(df,colnames(df)[-c(1,4)],verbose = F, codeRestriction = c("lev","clean"))
+df_prep=prepare(mk,df)
+df_train=df_prep %>% filter(suspicious_label!=(-999))
+df_test=df_prep %>% filter(suspicious_label==(-999))
+```
+
+**Another potential issue is Postal Code as in larger sets it might act as a demographic discriminant, also a lot of care should be done for those rare postal codes with pooling probably**
+
+### Model prep and parameters
+
+Now that a training and testing sets are ready. Let's further divide the training set into a train and validation sets (80/20) using stratified sampling. This will help avoid overfitting by stopping training once the validation set loss starts increasing.
+
+```{r}
+#| label: test_valid
+sp=initial_split(df_train,prop=0.8,strata = "suspicious_label")
+train=training(sp)
+valid=testing(sp)
+```
+
+Checking quickly, there are `r round(100*mean(train$suspicious_label),2)`% suspicious labels in training and `r round(100*mean(valid$suspicious_label),2)`% in our validation set. As the data is fairly imbalanced, I will add weight to the positive labels (#negative/#positive). Also, as a further measure to avoid overfitting, I will add some random column sampling per tree. I'll also convert the data to the XGBoost format.
+
+```{r}
+#| label: model_params
+params=list(objective="binary:logistic", #classification
+            eta=0.03, #training rate, smaller to be slightly more accurate
+            eval_metric=c("auc","logloss"), #standard loss, very affected by weights, AUC for control
+            scale_pos_weight=sum(train$suspicious_label==0)/sum(train$suspicious_label==1), #weights
+            colsample_bytree=1-exp(-1)) #sample columns at bootstrap limit
+xgb_train=xgb.DMatrix(as.matrix(train[,-2]),label=train$suspicious_label==1,missing=-999)
+xgb_valid=xgb.DMatrix(as.matrix(valid[,-2]),label=valid$suspicious_label==1,missing=-999)
+```
+
+### Training
+
+Let's go! When done, write the predictions to submit. Also look at AUC.
+
+```{r}
+#| label: model_train
+xgb.model=xgb.train(params = params,
+                    data = xgb_train,
+                    nrounds = 1000,
+                    early_stopping_rounds = 15,
+                    print_every_n = 50,
+                    watchlist = c(valid=xgb_valid))
+pred_valid=predict(xgb.model,xgb_valid)
+pred_test=predict(xgb.model,as.matrix(df_test[,-2]))
+submit=tibble(id=df %>% filter(suspicious_label==-999) %>% pull(id),score=pred_test)
+write_csv(submit,"test-predictions.csv")
+write_csv(valid %>% rename(Response=suspicious_label),"newdata.csv")
+xgb.save(xgb.model,"model.json")
+roc=roc(valid[,2],pred_valid,plot=T,ci=T,smooth=F,auc=T,print.auc=T)
+
+```
+
+### Interpretation
+
+Let's look at the SHAP summary plot and dependence plots for the top 3 variables.
+
+```{r}
+#| label: figures
+#| warning: false
+shap.plot.summary.wrap1(xgb.model,X = as.matrix(valid[,-2]))+ggtitle("SHAP Summary Plot")
+shap_long=shap.prep(xgb.model,X_train = as.matrix(valid[,-2]))
+int=shap.prep.interaction(xgb.model,as.matrix(valid[,-2]))
+p1=shap.plot.dependence(shap_long,"age",data_int = int,smooth=F)+ggtitle("Pure Age")+scale_y_continuous(limits = c(-7,3))+theme(axis.title.y = element_blank())
+p2=shap.plot.dependence(shap_long,"age",smooth=F)+ggtitle("Age Marginal")+scale_y_continuous(limits = c(-7,3))+theme(axis.title.y = element_blank())
+p3=shap.plot.dependence(shap_long,"min_tx",data_int=int,smooth=F)+scale_x_log10(breaks=seq(300,400,by=100))+ggtitle("Pure Min_Tx (log)")+scale_y_continuous(limits = c(-5,2))+theme(axis.title.y = element_blank(),axis.text.x = element_text(angle=90,vjust = .5))
+p4=shap.plot.dependence(shap_long,"min_tx",smooth=F)+scale_x_log10(breaks=seq(300,400,by=100))+ggtitle("Min Tx Marginal (log)")+scale_y_continuous(limits = c(-5,2))+theme(axis.title.y = element_blank(),axis.text.x = element_text(angle=90,vjust = .5))
+p5=shap.plot.dependence(shap_long,"mean_tx",data_int=int,smooth=F)+scale_x_log10(breaks=seq(600,800,by=200))+ggtitle("Pure Mean_Tx (log)")+scale_y_continuous(limits = c(-5,3))+theme(axis.title.y = element_blank(),axis.text.x = element_text(angle=90,vjust = .5))
+p6=shap.plot.dependence(shap_long,"mean_tx",smooth=F)+scale_x_log10(breaks=seq(600,800,by=200))+ggtitle("Mean Tx Marginal (log)")+scale_y_continuous(limits = c(-5,3))+theme(axis.title.y = element_blank(),axis.text.x = element_text(angle=90,vjust = .5))
+
+p=ggarrange(p1,p2,p3,p4,p5,p6,nrow=3,ncol=2,align = "hv")
+print(p)
+
+```
+
+From these graphs we can see that this model is highly discriminating for age. If you are young, you are likely suspicious, while if over 60, you are 5 to 6 ***orders of magnitude*** less likely to be found suspicious.
+
+Also, the model finds the minimum transaction amount to be very important, with somewhere around 300-400 making it more likely to have a suspicious label. The mean transaction amount is found to behave similarly, but with a breaking point around 600-800. It is interesting to see that due to the presence of other variables, the pure effect of mean_tx is brought down in the marginal. This is likely due to the presence of highly correlated variables like min_tx.
+
+Both variables seem to have a log-linear behavior, this seems to indicate that orders of magnitude of the transactions should be treated similarly and could be a potential engineered feature.
+
+## Model metrics
+
+For this problem, I would suggest that a precision recall break-even threshold be selected. This ensures that we are right sizing the effort and not sacrificing either precision or recall. However, because this is a problem where recall is fundamental, I would also suggest investigating some negatives. This could be done by pure probability sampling or ordering by some measure like "probability\*amount".
+
+```{r}
+#| label: threshold
+pred=prediction(predictions = pred_valid, labels = valid$suspicious_label)
+perf=performance(pred,measure = "prbe")
+thresh=perf@x.values[[1]][which.max(perf@y.values[[1]])]
+tp=sum((pred_valid>=thresh) & (valid$suspicious_label==1))
+tn=sum((pred_valid<thresh) & (valid$suspicious_label==0))
+fp=sum((pred_valid>=thresh) & (valid$suspicious_label==0))
+fn=sum((pred_valid<thresh) & (valid$suspicious_label==1))
+
+accuracy=(tn+tp)/nrow(valid)
+precision=tp/(tp+fp)
+recall=tp/(tp+fn)
+print("Confusion Matrix")
+table(pred=pred_valid>=thresh,actual=valid$suspicious_label)
+
+```
+
+In this case the threshold is `r round(thresh,3)` for which accuracy is `r round(accuracy,3)`, precision is `r round(precision,3)` and recall is `r round(recall,3)`. A priori, saying no one is suspicious, accuracy would be `r round(sum(valid$suspicious_label==0)/nrow(valid),3)`.
+
+## Conclusions and further work
+
+This is in principle a good model, an AUC over 0.9, (much) improved accuracy and reasonable precision and recall.
+
+However, there are many amber to red flags which I believe make it a "no go".
+
+The model classifies quite well ids with no transaction information. Purely based on demographics, which raises potential discriminatory problems. In this case, only a limited range of ages is likely to be flagged as suspicious.
+
+The presence of postal code can also raise potential discriminatory issues. In countries where there is a long established record of race segregation, a postal code is a proxy for race and average income. And in other places, it could be a proxy for immigration status as well.
+
+Before thinking about deploying, I would really like to gather more historical transaction data, and also other indicators of a user's real financial situation, salary, mortgage, credit score, debt, etc. Also, I would like to understand why some ids with no transaction data are labeled as suspicious, is it historical? Have they defaulted previously? Are they in a collection process? Have they ever been?
+
+Once this is done and the new model has good performance, I would deploy by using a managed platform (Azure, AWS, GCP). This can be either a batch process or a REST API on a web service, depending on the need for real time predictions. The advantage of this approach is that you can have version control, rapid rollbacks etc, as well as the CI/CD environment. The steps are the usual, containerize the model and potentially the feature engineering (Docker), create the ETL flow (can also contain part of the feature engineering), schedule batch processing or serve the API.
